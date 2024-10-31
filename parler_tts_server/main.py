@@ -1,4 +1,5 @@
 import time
+import io
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, OrderedDict
 
@@ -6,7 +7,7 @@ import huggingface_hub
 import soundfile as sf
 import torch
 from fastapi import Body, FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from huggingface_hub.hf_api import ModelInfo
 from openai.types import Model
 from parler_tts import ParlerTTSForConditionalGeneration
@@ -124,24 +125,45 @@ async def generate_audio(
     model: Annotated[str, Body()] = config.model,
     response_format: Annotated[ResponseFormat, Body()] = config.response_format,
     speed: Annotated[float, Body()] = SPEED,
-) -> FileResponse:
+) -> StreamingResponse:
     tts, tokenizer = model_manager.get_or_load_model(model)
+
     if speed != SPEED:
         logger.warning(
             "Specifying speed isn't supported by this model. Audio will be generated with the default speed"
         )
+
     start = time.perf_counter()
-    input_ids = tokenizer(voice, return_tensors="pt").input_ids.to(device)
-    prompt_input_ids = tokenizer(input, return_tensors="pt").input_ids.to(device)
+
+    # Tokenize voice and input with attention masks
+    voice_inputs = tokenizer(voice, return_tensors="pt", padding=True)
+    input_ids = voice_inputs.input_ids.to(device)
+    attention_mask = voice_inputs.attention_mask.to(device)
+
+    input_prompt = tokenizer(input, return_tensors="pt", padding=True)
+    prompt_input_ids = input_prompt.input_ids.to(device)
+    prompt_attention_mask = input_prompt.attention_mask.to(device)
+
+    # Pass attention masks to `generate` to address the warning
     generation = tts.generate(
-        input_ids=input_ids, prompt_input_ids=prompt_input_ids
-    ).to(  # type: ignore
-        torch.float32
-    )
+        input_ids=input_ids,
+        prompt_input_ids=prompt_input_ids,
+        attention_mask=attention_mask,
+        prompt_attention_mask=prompt_attention_mask
+    ).to(torch.float32)  # type: ignore
+
     audio_arr = generation.cpu().numpy().squeeze()
+
     logger.info(
         f"Took {time.perf_counter() - start:.2f} seconds to generate audio for {len(input.split())} words using {device.upper()}"
     )
-    # TODO: use an in-memory file instead of writing to disk
-    sf.write(f"out.{response_format}", audio_arr, tts.config.sampling_rate)
-    return FileResponse(f"out.{response_format}", media_type=f"audio/{response_format}")
+
+    # Write the audio to an in-memory file instead of disk
+    output_buffer = io.BytesIO()
+    sf.write(output_buffer, audio_arr, tts.config.sampling_rate, format=response_format)
+    output_buffer.seek(0)  # Move to the beginning of the BytesIO buffer
+
+    # Use StreamingResponse to return the in-memory file directly
+    return StreamingResponse(
+        output_buffer, media_type=f"audio/{response_format}"
+    )
